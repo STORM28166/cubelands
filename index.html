@@ -237,7 +237,7 @@ input[type=range]{cursor:pointer}
 /* ---------- rotate-to-landscape gate (touch) ---------- */
 #rotate-overlay{position:fixed;inset:0;z-index:95;display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:16px;background:rgba(4,8,18,.95);color:#fff;text-align:center;padding:24px}
-body.portrait-touch #rotate-overlay{display:flex}
+body.portrait-touch.in-world #rotate-overlay{display:flex}
 .rotate-phone{width:44px;height:74px;border:3px solid var(--blue2);border-radius:9px;position:relative;flex:none;
   box-shadow:0 0 22px rgba(56,189,248,.35);animation:rotateHint 1.9s ease-in-out infinite}
 .rotate-phone:after{content:"";position:absolute;left:50%;bottom:5px;transform:translateX(-50%);
@@ -1274,6 +1274,62 @@ function findSpawn(){
   const{ h}=biomeAt(8,8);return{x:8.5,y:h+1.01,z:8.5};
 }
 
+/* --- Safe placement -------------------------------------------------------
+   findSpawn() only knows the noise height of a column. The generated column
+   can differ — a tree trunk or village roof can sit exactly where the player
+   is placed, a save can restore a position inside solid rock, and chunks
+   that have not generated yet read as AIR. These helpers always verify a
+   placement against the actual generated blocks before trusting it. */
+function ensureAreaChunks(x,z){
+  const pcx=floor(x/16),pcz=floor(z/16);
+  for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++)ensureChunkData(pcx+dx,pcz+dz);
+}
+function standTopAt(x,z){ /* feet level on the topmost standable block in this column, or null */
+  if(!chunkAt(floor(x/16),floor(z/16)))return null;
+  for(let y=WH-3;y>=1;y--){
+    if(!isSolid(getBlock(x,y,z)))continue;
+    if(isSolid(getBlock(x,y+1,z))||isSolid(getBlock(x,y+2,z)))continue;
+    return y+1;
+  }
+  return null;
+}
+function cleanGroundAt(x,z){ /* natural terrain top if the column is clear to stand on, else null */
+  if(!chunkAt(floor(x/16),floor(z/16)))return null;
+  const h=biomeAt(x,z).h;
+  if(h<=SEA)return null;
+  if(!isSolid(getBlock(x,h,z)))return null;
+  if(isSolid(getBlock(x,h+1,z))||isSolid(getBlock(x,h+2,z)))return null; /* tree / wall / roof in the way */
+  return h+1;
+}
+function safeSpawnPoint(){
+  const s=findSpawn();
+  ensureAreaChunks(s.x,s.z);
+  const bx=floor(s.x),bz=floor(s.z);
+  for(let r=0;r<=10;r++){
+    for(let dx=-r;dx<=r;dx++)for(let dz=-r;dz<=r;dz++){
+      if(Math.max(abs(dx),abs(dz))!==r)continue;
+      const gy=cleanGroundAt(bx+dx,bz+dz);
+      if(gy!==null)return{x:bx+dx+0.5,y:gy+0.05,z:bz+dz+0.5};
+    }
+  }
+  const top=standTopAt(bx,bz);
+  if(top!==null)return{x:s.x,y:top+0.05,z:s.z};
+  return{x:s.x,y:s.y+0.05,z:s.z};
+}
+function liftPlayerOutOfGround(){
+  /* If the player ended up embedded in solid blocks (a chunk generated
+     around a falling player, a save restored inside rock, a block fell on
+     him), lift him to the first free space above — or onto the surface. */
+  if(!collidesAt(P.pos.x,P.pos.y,P.pos.z))return false;
+  for(let dy=0.25;dy<=6;dy+=0.25){
+    if(!collidesAt(P.pos.x,P.pos.y+dy,P.pos.z)){P.pos.y+=dy;P.vel.y=Math.max(0,P.vel.y);return true}
+  }
+  ensureAreaChunks(P.pos.x,P.pos.z);
+  const top=standTopAt(floor(P.pos.x),floor(P.pos.z));
+  if(top!==null){P.pos.y=top+0.05;P.vel.set(0,0,0);return true}
+  const ss=safeSpawnPoint();P.pos.set(ss.x,ss.y,ss.z);P.vel.set(0,0,0);return true;
+}
+
 /* ---------------- Lighting (per-chunk sky + block light BFS) ---------------- */
 function computeChunkLight(ch){
   const cx=ch.cx,cz=ch.cz;
@@ -1812,6 +1868,10 @@ function sneakEdgeGuard(dx,dz){
 function dampF(k,dt){return 1-Math.exp(-k*dt)} /* frame-rate independent smoothing */
 function playerPhysics(dt){
   if(P.dead)return;
+  /* never collide against a chunk that has not generated yet: ungenerated
+     chunks read as AIR, so without this the ground can vanish under the
+     player for the frames it takes streaming to catch up */
+  if(!chunkAt(floor(P.pos.x/16),floor(P.pos.z/16)))ensureAreaChunks(P.pos.x,P.pos.z);
   const inWater=isInLiquid("water"),inLava=isInLiquid("lava");
   P.inWater=inWater;P.inLava=inLava;
   P.headWater=BLOCKS[getBlock(floor(P.pos.x),floor(P.pos.y+1.55),floor(P.pos.z))]&&getBlock(floor(P.pos.x),floor(P.pos.y+1.55),floor(P.pos.z))===B.WATER;
@@ -1866,6 +1926,7 @@ function playerPhysics(dt){
   moveAxis("z",P.vel.z*dt);
   moveAxis("y",P.vel.y*dt);
   P.onGroundPrev=P.onGround;
+  liftPlayerOutOfGround(); /* terrain can pop in around a falling player — never leave him buried */
   if(P.onGround&&!wasGrounded){
     const fell=P.fallStart-P.pos.y;
     if(fell>1.2)P.landDip=clamp(fell/9,0.18,1);
@@ -1875,7 +1936,13 @@ function playerPhysics(dt){
     P.fallStart=0;
     if(Math.abs(P.vel.x)+Math.abs(P.vel.z)>1)AU.step(blockSoundAtFeet());
   } else if(!P.onGround&&P.vel.y>0){P.fallStart=0}
-  if(P.pos.y<-12){hurtPlayer(4,"the void");P.pos.y=2;P.vel.y=0}
+  if(P.pos.y<-12){hurtPlayer(4,"the void");
+    /* back on TOP of the world — the old rescue put the player at y=2,
+       sealed inside solid stone under the terrain */
+    ensureAreaChunks(P.pos.x,P.pos.z);
+    const top=standTopAt(floor(P.pos.x),floor(P.pos.z));
+    if(top!==null){P.pos.y=top+0.05}else{const ss=safeSpawnPoint();P.pos.set(ss.x,ss.y,ss.z)}
+    P.vel.set(0,0,0);lastChunkCenter=null}
   /* footsteps */
   const hSpeed=Math.hypot(P.vel.x,P.vel.z);
   if(P.onGround&&hSpeed>1){P.stepAcc+=hSpeed*dt;if(P.stepAcc>2.4){P.stepAcc=0;AU.step(blockSoundAtFeet())}}
@@ -1931,8 +1998,12 @@ function dropAllItems(){
   G.xp=0;G.xpLevel=0;updateHUD();
 }
 function respawn(){
-  const s=G.spawnSet||findSpawn();
-  P.pos.set(s.x,s.y+0.1,s.z);P.vel.set(0,0,0);
+  let s;
+  if(G.spawnSet){ensureAreaChunks(G.spawnSet.x,G.spawnSet.z);s={x:G.spawnSet.x,y:G.spawnSet.y+0.05,z:G.spawnSet.z}}
+  else s=safeSpawnPoint();
+  P.pos.set(s.x,s.y,s.z);P.vel.set(0,0,0);
+  liftPlayerOutOfGround(); /* a bed spawn can end up inside blocks after edits */
+  lastChunkCenter=null;
   P.hp=20;P.hunger=20;P.air=10;P.dead=false;P.flying=false;
   hideScreens();$("hud").classList.add("on");updateTouchUI();
   chat("You wake up at your spawn point.");
@@ -3626,6 +3697,7 @@ function gameLoop(){
     pollKeys();pollGamepad(dt);
     /* time */
     G.time+=dt/600;if(G.time>=1){G.time-=1;G.day++}
+    updateChunks(); /* stream chunks BEFORE physics, so collision never runs against ungenerated AIR */
     playerPhysics(dt);
     /* mining / attacking */
     if(input.mine&&!anyScreenOpen()){
@@ -3655,7 +3727,6 @@ function gameLoop(){
     updateDrops(dt);updateXPOrbs(dt);updateParticles(dt);updateTNT(dt);updateArrows(dt);
     updateMobs(dt);mobSpawning(dt);tickFurnaces(dt);
     updateWeather(dt);
-    updateChunks();
     /* camera: view bob, landing dip, hurt shake, sprint FOV kick */
     const hSpd=Math.hypot(P.vel.x,P.vel.z);
     const bobbing=P.onGround&&hSpd>1.2&&!P.flying;
@@ -3772,7 +3843,7 @@ function runCommand(raw){
       if(["clear","rain","storm"].includes(v)){G.weather=v;G.weatherT=180;say("Weather: "+v)}
       else say("Usage: /weather clear|rain|storm");
       break}
-    case "spawn":{const s=G.spawnSet||findSpawn();P.pos.set(s.x,s.y+0.2,s.z);P.vel.set(0,0,0);lastChunkCenter=null;say("Back at spawn.");break}
+    case "spawn":{let s;if(G.spawnSet){ensureAreaChunks(G.spawnSet.x,G.spawnSet.z);s={x:G.spawnSet.x,y:G.spawnSet.y+0.2,z:G.spawnSet.z}}else s=safeSpawnPoint();P.pos.set(s.x,s.y,s.z);P.vel.set(0,0,0);liftPlayerOutOfGround();lastChunkCenter=null;say("Back at spawn.");break}
     case "spawnpoint":{G.spawnSet={x:P.pos.x,y:P.pos.y,z:P.pos.z};say("Spawn point set here.");break}
     case "heal":P.hp=P.maxHp;P.hunger=20;say("Fully healed & fed.");updateHUD();break;
     case "fly":toggleFly();break;
@@ -3839,6 +3910,7 @@ function resumeGame(){
 function quitToTitle(){
   saveWorldToList(false);
   G.playing=false;G.paused=false;menuDemo=null;
+  document.body.classList.remove("in-world");
   /* clear world */
   for(const m of[...mobs])scene.remove(m.group);mobs.length=0;
   for(const d of drops)scene.remove(d.vis);drops.length=0;
@@ -3889,6 +3961,14 @@ function startWorld(seed,name,mode,saveData){
     $("load-fill").style.width=pct+"%";$("load-pct").textContent=pct+"%";
     if(jobs.length){requestAnimationFrame(step);return}
     $("loading").classList.remove("on");
+    /* verify the start position against the generated world before play:
+       fresh spawns move to a checked-clear ground column (no tree trunks or
+       roofs in the spawn column); restored saves are lifted out if the saved
+       spot ended up inside solid ground */
+    if(saveData&&saveData.player){liftPlayerOutOfGround()}
+    else{const ss=safeSpawnPoint();P.pos.set(ss.x,ss.y,ss.z);P.vel.set(0,0,0)}
+    lastChunkCenter=null;
+    document.body.classList.add("in-world"); /* rotate gate applies in-world, not over the menus */
     G.playing=true;G.paused=false;
     hideScreens();$("hud").classList.add("on");
     $("fps-box").style.display=S.showFps?"block":"none";
