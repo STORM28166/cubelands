@@ -1882,7 +1882,12 @@ function playerPhysics(dt){
   /* input direction */
   const iv=inputVec();
   const sin=Math.sin(P.yaw),cos=Math.cos(P.yaw);
-  let mx=(iv.x*cos-iv.z*sin),mz=(iv.x*sin+iv.z*cos);
+  /* rotate input into world space with the SAME yaw the camera renders with:
+     camera forward is (-sin yaw, -cos yaw) and camera right is (cos yaw, -sin yaw),
+     so W (iv.z=-1) must land exactly on forward and D (iv.x=+1) exactly on right.
+     The old signs rotated by -yaw instead, mirroring movement against the view —
+     fine facing spawn, backwards the moment you turned: the "inverted controls" bug */
+  let mx=(iv.x*cos+iv.z*sin),mz=(-iv.x*sin+iv.z*cos);
   const ml=Math.hypot(mx,mz);if(ml>1){mx/=ml;mz/=ml}
   const sprint=P.sprinting&&P.hunger>6;
   let speed=P.flying?13:(sprint?6.4:P.sneaking?1.6:4.4);
